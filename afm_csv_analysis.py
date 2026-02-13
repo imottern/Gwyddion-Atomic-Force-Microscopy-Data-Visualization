@@ -2,6 +2,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
+import matplotlib.ticker as ticker
+from matplotlib.widgets import SpanSelector
+
 
 
 
@@ -14,6 +18,7 @@ class afmData:
         elif type(source) == pd.DataFrame:
             self.data = source
         self.name = name
+        self.steps = None
     matrial_thicknesses = {"crsbr": 7.959e-10, "f3gt": 8e-10, "hbn":6.617e-10, "graphene":3.45e-10, "ptte2": 2.4e-10, "tairte":7e-10}
     def __str__(self):
         return str(self.data.info())
@@ -43,7 +48,7 @@ class afmData:
         Returns: raw dataframe
         """ 
         return self.data
-    def select_profiles(self, profiles):
+    def select_profiles(self, profiles, new_name=None):
         """
         selects specific profiles from the data based on given indices
         Parameters: profiles - list of profiles users wants to select
@@ -54,7 +59,10 @@ class afmData:
         for i in profiles:
             abridged_data[f'position{i}'] = self.data[f'position{i}']
             abridged_data[f'height{i}'] = self.data[f'height{i}']
-        return afmData(abridged_data, name=self.name + " Abridged")
+        if new_name is None:
+            return afmData(abridged_data, name=self.name + " Abridged")
+        elif new_name is not None:
+            return afmData(abridged_data, name=new_name)
     def threshold_averaging(self, threshold):
         """
         averages profiles by checking if consecutive heights are within a given threshold
@@ -81,6 +89,7 @@ class afmData:
                 avg = float(np.mean(step))
                 averaged_values.extend([avg] * len(step))
             averaged_data[profiles[i]] = averaged_values
+            #update the steps dictionary
         return afmData(averaged_data, name=self.name + " Threshold Averaged")
     def zero_minimums(self):
         """
@@ -94,6 +103,24 @@ class afmData:
             min_height = zeroed_data[profiles[i]].min()
             zeroed_data[profiles[i]] = zeroed_data[profiles[i]] - min_height
         return afmData(zeroed_data, name=self.name)
+    def reverse(self, profiles):
+        """
+        Remove NaNs and reverse height values for selected profiles,
+        preserving DataFrame length and index.
+        """
+
+        for i in list(profiles):
+            x_col = f'position{i}'
+            y_col = f'height{i}'
+
+            # Select valid rows
+            valid = self.data[[x_col, y_col]].dropna()
+
+            reversed_heights = valid[y_col].to_numpy()[::-1]
+
+            # Assign back only to valid rows
+            self.data.loc[valid.index, y_col] = reversed_heights
+
     def smoothing_data(self, window_size):
         """
         smooths data using a moving average with specified size
@@ -111,18 +138,29 @@ class afmData:
         Parameters: none
         Returns: plotly figure object
         """
-        fig = None
-        profiles = list(self.data.columns)
-        for i in range(1, (len(profiles)//2)+1):
-            if fig is None:
-                fig = px.line(self.data, x=f'position{profiles[i][-1]}', y=f'height{profiles[i][-1]}', labels={f'Profile{profiles[i][-1]}'}, markers=False)
-                fig.data[0].name = f'Profile{profiles[i][-1]}'  
-                fig.data[0].showlegend = True 
-            else:
-                fig.add_scatter(x=self.data[f'position{profiles[i][-1]}'], y=self.data[f'height{profiles[i][-1]}'], name=f'Profile{"".join(c for c in profiles[i] if c.isdigit())}')
-        fig.update_layout(title_text=f'{self.name} Height Profiles', xaxis_title='Position [nm]', yaxis_title='Height [nm]')
+        fig = go.Figure()
+
+        # Extract profile numbers dynamically
+        profile_nums = sorted(
+            {col.replace('position', '') for col in self.data.columns if col.startswith('position')}
+        )
+
+        for n in profile_nums:
+            fig.add_scatter(
+                x=self.data[f'position{n}'],    
+                y=self.data[f'height{n}'],
+                mode='lines',
+                name=f'Profile {n}'
+            )
+
+        fig.update_layout(
+            title=f'{self.name} Height Profiles',
+            xaxis_title='Position [nm]',
+            yaxis_title='Height [nm]'
+        )
+
         return fig
-    def graph(self, save=False, raw=None, show_steps=False):
+    def graph(self, save=False, raw=None, title=True, legend = True, grid = True, show_steps=False,threshold_factor=0.4, min_plateau_fraction=0.05):
         """
         creates a matplotlib graph of the data
         Parameters: save - boolean if user wants save the graph as a png file
@@ -143,9 +181,8 @@ class afmData:
                 raw_y = [val * 1e9 for val in raw_data[profiles[i + 1]]]
                 ax.plot(raw_x, raw_y, alpha=0.4, color=color)
             if show_steps:
-                steps = self.find_steps()
-                if label in steps:
-                    s = steps[label]
+                if label in self.steps:
+                    s = self.steps[label]
                     # Plateau lines
                     p1_x = np.array(s["plateau1_range"]) * 1e9
                     p2_x = np.array(s["plateau2_range"]) * 1e9
@@ -180,11 +217,17 @@ class afmData:
                         va="center",
                         bbox=dict(facecolor="white", edgecolor="none", alpha=0.7)
                     )
-        ax.legend()
-        ax.set_title(f"{self.name} Height Profiles")
-        ax.set_xlabel("Position [nm]")
+        if legend:
+            ax.legend()
+        if title:
+            ax.set_title(f"{self.name} Height Profiles")
+        ax.xaxis.set_major_formatter(
+        ticker.FuncFormatter(lambda val, pos: f"{val * 0.001:.0f}")
+            )
+        ax.set_xlabel("Position [um]")
         ax.set_ylabel("Height [nm]")
-        ax.grid()
+        if grid:
+            ax.grid()
         if save:
             plt.savefig(f"{self.name} Height Profiles.png")
         plt.show() 
@@ -193,7 +236,7 @@ class afmData:
         finds steps in the data by checking for significant changes in height
         Parameters: threshold_factor - factor to the standard deviation of the derivative to determine the threshold for significant changes
                     min_plateau_fraction - minimum fraction of the profile length that a plateau must cover to be considered valid
-        Returns: step heights
+        Returns: dictionary with step information for each profile
         """
         step_dict = {}
         profiles = list(self.data.columns)
@@ -262,6 +305,7 @@ class afmData:
                 "plateau2_range": plateau2_range,
             }
 
+        self.steps = step_dict
         return step_dict
     def find_height(self):
         """
@@ -280,11 +324,160 @@ class afmData:
             height.append(
                 steps[key]["step_height"] if key in steps else None
             )
-
         return height
+    def find_steps_interactive(self):
+        """
+        Interactive step height selection using Plotly (VS Code safe).
+        User box-selects TWO plateau regions.
+        """
+
+        import numpy as np
+        import plotly.graph_objects as go
+        from IPython.display import display
+
+        self.steps = {}
+        selected_ranges = []
+        self.distance = self.data.iloc[:, 0]
+        self.height = self.data.iloc[:, 1]
+
+        x = np.asarray(self.distance)
+        z = np.asarray(self.height)
+
+        fig = go.FigureWidget(
+            data=[
+                go.Scatter(
+                    x=x,
+                    y=z,
+                    mode="lines",
+                    name="AFM Profile",
+                    uid="afm_trace"
+                )
+            ]
+        )
+
+        fig.update_layout(
+            title="Box-select TWO plateau regions",
+            xaxis_title="Distance",
+            yaxis_title="Height",
+            dragmode="select",
+            shapes=[],
+        )
+
+        def on_selection(trace, points, selector):
+            nonlocal selected_ranges
+
+            if not points.point_inds:
+                return
+
+            inds = np.array(points.point_inds)
+            xmin = float(x[inds].min())
+            xmax = float(x[inds].max())
+
+            selected_ranges.append((xmin, xmax))
+
+            with fig.batch_update():
+                fig.layout.shapes += (
+                    dict(
+                        type="rect",
+                        xref="x",
+                        yref="paper",
+                        x0=xmin,
+                        x1=xmax,
+                        y0=0,
+                        y1=1,
+                        fillcolor="rgba(0, 0, 255, 0.25)",
+                        line_width=0,
+                    ),
+                )
+
+            if len(selected_ranges) == 2:
+                process_plateaus()
+
+        def process_plateaus():
+            (x1_min, x1_max), (x2_min, x2_max) = selected_ranges
+
+            mask1 = (x >= x1_min) & (x <= x1_max)
+            mask2 = (x >= x2_min) & (x <= x2_max)
+
+            z1 = z[mask1]
+            z2 = z[mask2]
+
+            h1_mean = float(np.mean(z1))
+            h2_mean = float(np.mean(z2))
+            h1_std = float(np.std(z1))
+            h2_std = float(np.std(z2))
+
+            step_height = abs(h2_mean - h1_mean)
+
+            with fig.batch_update():
+                fig.layout.shapes += (
+                    dict(
+                        type="line",
+                        xref="x",
+                        yref="y",
+                        x0=x1_min,
+                        x1=x1_max,
+                        y0=h1_mean,
+                        y1=h1_mean,
+                        line=dict(dash="dash"),
+                    ),
+                    dict(
+                        type="line",
+                        xref="x",
+                        yref="y",
+                        x0=x2_min,
+                        x1=x2_max,
+                        y0=h2_mean,
+                        y1=h2_mean,
+                        line=dict(dash="dash"),
+                    ),
+                )
+
+                fig.layout.title = f"Step height = {step_height:.3f}"
+
+            self.steps["manual_step_1"] = {
+                "plateau_1": {
+                    "x_range": (x1_min, x1_max),
+                    "mean_height": h1_mean,
+                    "std_height": h1_std,
+                },
+                "plateau_2": {
+                    "x_range": (x2_min, x2_max),
+                    "mean_height": h2_mean,
+                    "std_height": h2_std,
+                },
+                "step_height": step_height,
+            }
+
+            print(f"Step height: {step_height:.3f}")
+
+        fig.data[0].on_selection(on_selection)
+
+        display(fig)
+        return fig
+    def average_profiles(self):
+        """
+        combines multiple afm profiles into one averaged profile
+        """
+        new = {}
+        pos_cols = [c for c in self.data.columns if c.startswith("position")]
+        lengths = {
+            col: self.data[col].notna().sum()
+            for col in pos_cols
+        }
+        col = max(lengths, key=lengths.get)
+        new['mean_position'] = self.data[col]
+        # Select all height columns
+        height_cols = [c for c in self.data.columns if c.startswith("height")]
+        # Replace NaNs with 0
+        heights_filled = self.data[height_cols].fillna(0)
+        # Average across profiles (row-wise)
+        average_height = heights_filled.mean(axis=1)
+        new["height_avg"] = average_height
+        return new
 
 
-
+        
 
 
 
@@ -293,8 +486,7 @@ class afmData:
 
 # to-do:
 # - add function to manually select steps
-# - add function to calculate step height
-# - update graphing functions to include step heights
+# - add fucntion to average several profiles into one
 # - add function to calulate layers
 
 
